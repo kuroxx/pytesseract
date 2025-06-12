@@ -8,6 +8,7 @@ import string
 import subprocess
 import sys
 from contextlib import contextmanager
+import csv
 from csv import QUOTE_NONE
 from errno import ENOENT
 from functools import wraps
@@ -196,9 +197,13 @@ def prepare(image):
 
     if 'A' in image.getbands():
         # discard and replace the alpha channel with white background
-        background = Image.new(RGB_MODE, image.size, (255, 255, 255))
-        background.paste(image, (0, 0), image.getchannel('A'))
-        image = background
+        image = (
+            Image.alpha_composite(
+                Image.new('RGBA', image.size, (255, 255, 255, 255)),
+                image.convert('RGBA'),
+            )
+            .convert(RGB_MODE)
+        )
 
     image.format = extension
     return image, extension
@@ -357,35 +362,29 @@ def run_and_get_output(
 
 
 def file_to_dict(tsv, cell_delimiter, str_col_idx):
-    result = {}
-    rows = [row.split(cell_delimiter) for row in tsv.strip().split('\n')]
-    if len(rows) < 2:
-        return result
-
-    header = rows.pop(0)
-    length = len(header)
-    if len(rows[-1]) < length:
-        # Fixes bug that occurs when last text string in TSV is null, and
-        # last row is missing a final cell in TSV file
-        rows[-1].append('')
+    """Parse TSV data into a dictionary of columns."""
+    reader = csv.DictReader(
+        (line for line in tsv.splitlines() if line),
+        delimiter=cell_delimiter,
+        quoting=QUOTE_NONE,
+    )
+    headers = reader.fieldnames or []
+    if not headers:
+        return {}
 
     if str_col_idx < 0:
-        str_col_idx += length
+        str_col_idx += len(headers)
 
-    for i, head in enumerate(header):
-        result[head] = list()
-        for row in rows:
-            if len(row) <= i:
-                continue
+    result = {h: [] for h in headers}
 
-            if i != str_col_idx:
+    for row in reader:
+        for idx, head in enumerate(headers):
+            val = row.get(head, '')
+            if idx != str_col_idx:
                 try:
-                    val = int(float(row[i]))
-                except ValueError:
-                    val = row[i]
-            else:
-                val = row[i]
-
+                    val = int(float(val))
+                except (ValueError, TypeError):
+                    pass
             result[head].append(val)
 
     return result
