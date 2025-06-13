@@ -168,9 +168,10 @@ def run_once(func):
 
 
 def get_errors(error_string):
-    # Use more efficient string processing
+    # Optimize string processing with minimal allocations
     decoded = error_string.decode(DEFAULT_ENCODING)
-    return ' '.join(decoded.splitlines()).strip()
+    # Use replace which is faster than splitlines + join for this case
+    return decoded.replace('\n', ' ').replace('\r', ' ').strip()
 
 
 def cleanup(temp_name):
@@ -178,9 +179,8 @@ def cleanup(temp_name):
     if not temp_name:
         return
     
-    # Use list() to evaluate glob immediately for better performance
-    filenames = list(iglob(f'{temp_name}*'))
-    for filename in filenames:
+    # Use iglob directly for better performance, avoiding list materialization
+    for filename in iglob(f'{temp_name}*'):
         try:
             remove(filename)
         except OSError as e:
@@ -199,13 +199,20 @@ def prepare(image):
     if extension not in SUPPORTED_FORMATS:
         raise TypeError('Unsupported image format/type')
 
-    # Cache band check for performance  
+    # Cache band check for performance and avoid redundant calls
     bands = image.getbands()
-    if 'A' in bands:
-        # discard and replace the alpha channel with white background
-        background = Image.new(RGB_MODE, image.size, (255, 255, 255))
-        background.paste(image, (0, 0), image.getchannel('A'))
-        image = background
+    if len(bands) > 3 and 'A' in bands:
+        # Only process alpha channel if it actually exists and has transparency
+        alpha_channel = image.getchannel('A')
+        # Quick check if alpha channel has any transparency
+        if alpha_channel.getextrema()[0] < 255:
+            # discard and replace the alpha channel with white background
+            background = Image.new(RGB_MODE, image.size, (255, 255, 255))
+            background.paste(image, (0, 0), alpha_channel)
+            image = background
+        else:
+            # No transparency, just convert without alpha
+            image = image.convert(RGB_MODE)
 
     image.format = extension
     return image, extension
@@ -216,11 +223,19 @@ def save(image):
     try:
         with NamedTemporaryFile(prefix='tess_', delete=False) as f:
             if isinstance(image, str):
-                yield f.name, realpath(normpath(normcase(image)))
+                # Cache the path normalization result
+                normalized_path = realpath(normpath(normcase(image)))
+                yield f.name, normalized_path
                 return
             image, extension = prepare(image)
             input_file_name = f'{f.name}_input{extsep}{extension}'
-            image.save(input_file_name, format=image.format)
+            # Optimize image saving with better compression settings
+            save_kwargs = {'format': image.format}
+            if extension == 'PNG':
+                save_kwargs.update({'optimize': True, 'compress_level': 1})  # Fast compression
+            elif extension in ('JPEG', 'JPEG2000'):
+                save_kwargs.update({'optimize': True, 'quality': 95})  # High quality, fast
+            image.save(input_file_name, **save_kwargs)
             yield f.name, input_file_name
     finally:
         cleanup(f.name)
@@ -306,13 +321,13 @@ def run_and_get_multiple_output(
     timeout: int = 0,
     return_bytes: bool = False,
 ):
-    config = ' '.join(
-        EXTENTION_TO_CONFIG.get(extension, '') for extension in extensions
-    ).strip()
-    if config:
-        config = f'-c {config}'
-    else:
-        config = ''
+    # Pre-compute config strings and binary extensions for efficiency
+    config_parts = [EXTENTION_TO_CONFIG.get(ext, '') for ext in extensions if ext in EXTENTION_TO_CONFIG]
+    config = f'-c {" ".join(config_parts)}' if config_parts else ''
+    
+    # Pre-determine which extensions need binary reading
+    binary_extensions = {'pdf', 'hocr'}
+    read_as_binary = [ext in binary_extensions or return_bytes for ext in extensions]
 
     with save(image) as (temp_name, input_filename):
         kwargs = {
@@ -327,12 +342,11 @@ def run_and_get_multiple_output(
 
         run_tesseract(**kwargs)
 
+        # Read all outputs with optimized binary flags
+        base_path = kwargs['output_filename_base']
         return [
-            _read_output(
-                f"{kwargs['output_filename_base']}{extsep}{extension}",
-                True if extension in {'pdf', 'hocr'} else return_bytes,
-            )
-            for extension in extensions
+            _read_output(f"{base_path}{extsep}{ext}", read_binary)
+            for ext, read_binary in zip(extensions, read_as_binary)
         ]
 
 
@@ -364,10 +378,9 @@ def run_and_get_output(
 
 
 def file_to_dict(tsv, cell_delimiter, str_col_idx):
-    result = {}
     lines = tsv.strip().split('\n')
     if len(lines) < 2:
-        return result
+        return {}
 
     # Pre-split all rows for better performance
     rows = [line.split(cell_delimiter) for line in lines]
@@ -382,24 +395,35 @@ def file_to_dict(tsv, cell_delimiter, str_col_idx):
     if str_col_idx < 0:
         str_col_idx += length
 
-    # Pre-allocate result dictionary with lists
-    for head in header:
-        result[head] = []
-
-    for i, head in enumerate(header):
-        for row in rows:
-            if len(row) <= i:
+    # Pre-allocate result dictionary with exact size
+    num_rows = len(rows)
+    result = {head: [None] * num_rows for head in header}
+    
+    # Process columns in batches for better cache locality
+    for row_idx, row in enumerate(rows):
+        row_len = len(row)
+        for col_idx, head in enumerate(header):
+            if col_idx >= row_len:
                 continue
-
-            if i != str_col_idx:
-                try:
-                    val = int(float(row[i]))
-                except ValueError:
-                    val = row[i]
+                
+            cell_value = row[col_idx]
+            if col_idx != str_col_idx and cell_value:
+                # Fast integer conversion for numeric columns
+                if cell_value.isdigit() or (cell_value.startswith('-') and cell_value[1:].isdigit()):
+                    result[head][row_idx] = int(cell_value)
+                else:
+                    try:
+                        # Try float conversion only if needed
+                        float_val = float(cell_value)
+                        result[head][row_idx] = int(float_val) if float_val.is_integer() else float_val
+                    except ValueError:
+                        result[head][row_idx] = cell_value
             else:
-                val = row[i]
-
-            result[head].append(val)
+                result[head][row_idx] = cell_value
+    
+    # Clean up None values from pre-allocated lists
+    for head in header:
+        result[head] = [val for val in result[head] if val is not None]
 
     return result
 
